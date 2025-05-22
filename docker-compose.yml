@@ -1,0 +1,128 @@
+version: '3.8'
+# based on https://github.com/n8n-io/n8n-hosting/blob/main/docker-compose/withPostgres/docker-compose.yml
+volumes:
+  db_storage:
+  redis_storage:
+  n8n_storage:
+  n8n_backup:
+  n8n_shared:
+
+networks:
+  n8n_net:
+
+x-n8n-base: &n8n-base
+  image: docker.n8n.io/n8nio/n8n
+  networks: [n8n_net]
+  environment:
+    - DB_TYPE=postgresdb
+    - DB_POSTGRESDB_HOST=n8n-postgres
+    - DB_POSTGRESDB_PORT=5432
+    - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+    - DB_POSTGRESDB_USER=${POSTGRES_NON_ROOT_USER}
+    - DB_POSTGRESDB_PASSWORD=${POSTGRES_NON_ROOT_PASSWORD}
+    - EXECUTIONS_MODE=queue
+    - QUEUE_BULL_REDIS_HOST=n8n-redis
+    - QUEUE_HEALTH_CHECK_ACTIVE=true
+    - N8N_ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    - N8N_RUNNERS_ENABLED=true
+    - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
+    - OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=true
+    - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
+    - TZ=America/Argentina/Buenos_Aires
+  depends_on:
+    n8n-postgres:
+      condition: service_healthy
+    n8n-redis:
+      condition: service_healthy
+
+services:
+
+  n8n-postgres:
+    image: postgres:16
+    container_name: n8n-postgres
+    networks: [n8n_net]
+    restart: always
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_NON_ROOT_USER=${POSTGRES_NON_ROOT_USER}
+      - POSTGRES_NON_ROOT_PASSWORD=${POSTGRES_NON_ROOT_PASSWORD}
+    volumes:
+      - db_storage:/var/lib/postgresql/data
+      - ./init-data.sh:/docker-entrypoint-initdb.d/init-data.sh
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -h localhost -U ${POSTGRES_USER} -d ${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  n8n-redis:
+    image: redis:7.2-alpine
+    container_name: n8n-redis
+    networks: [n8n_net]
+    restart: always
+    volumes:
+      - redis_storage:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  n8n-import:
+    <<: *n8n-base
+    container_name: n8n-import
+    restart: "no"
+    entrypoint: /bin/sh
+    command:
+      - "-c"
+      - |
+        if [ -d /backup/credentials ]; then
+          echo "Importing credentials..."
+          n8n import:credentials --separate --input=/backup/credentials
+        else
+          echo "No credentials found to import"
+        fi
+        if [ -d /backup/workflows ]; then
+          echo "Importing workflows..."
+          n8n import:workflow --separate --input=/backup/workflows
+        else
+          echo "No workflows found to import"
+        fi
+        exit 0
+    volumes:
+      - n8n_backup:/backup
+
+  n8n:
+    <<: *n8n-base
+    container_name: n8n
+    restart: always
+    ports:
+      - 5678:5678
+    volumes:
+      - n8n_storage:/home/node/.n8n
+      - n8n_backup:/backup
+      - n8n_shared:/data/shared
+
+    depends_on:
+      n8n-import:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5678/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  n8n-worker:
+    <<: *n8n-base
+    container_name: n8n-worker
+    restart: always
+    command: worker
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
